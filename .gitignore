@@ -1,3 +1,4 @@
 data/*
 LConvNet/*
+!*/.gitkeep
 __pycache__
