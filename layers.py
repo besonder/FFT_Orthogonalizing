@@ -48,16 +48,23 @@ class StridedConv(nn.Module):
 def cayley(W, ED=False):
     if len(W.shape) == 2:
         return cayley(W[None])[0]
-    _, cout, cin = W.shape
-    if cin > cout:
-        return cayley(W.transpose(1, 2)).transpose(1, 2)
-    U, V = W[:, :cin], W[:, cin:]
-    I = torch.eye(cin, dtype=W.dtype, device=W.device)[None, :, :]
-    A = U - U.conj().transpose(1, 2) + V.conj().transpose(1, 2) @ V
-    iIpA = torch.inverse(I + A)
+
     if ED:
+        _, cin, cin = W.shape
+        I = torch.eye(cin, dtype=W.dtype, device=W.device)[None, :, :]
+        A = W - W.conj().transpose(1, 2)
+        # print((I+A).shape)
+        iIpA = torch.inverse(I + A)
         return iIpA @ (I - A)
+
     else:
+        _, cout, cin = W.shape
+        if cin > cout:
+            return cayley(W.transpose(1, 2)).transpose(1, 2)
+        U, V = W[:, :cin], W[:, cin:]
+        I = torch.eye(cin, dtype=W.dtype, device=W.device)[None, :, :]
+        A = U - U.conj().transpose(1, 2) + V.conj().transpose(1, 2) @ V
+        iIpA = torch.inverse(I + A)
         return torch.cat((iIpA @ (I - A), -2 * V @ iIpA), axis=1)
 
 
@@ -92,39 +99,36 @@ class CayleyConv(StridedConv, nn.Conv2d):
 
 class CayleyConvED(StridedConv, nn.Conv2d):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # super().__init__(*args, **kwargs)
+        super().__init__(args[0], args[0], args[2], **kwargs)
+        self.bias = nn.Parameter(torch.zeros(args[1]))
+        self.args = args
         self.register_parameter('alpha', None)
-        self.Hset = []
+        # self.Hready = False
+        self.H = None
 
     def genH(self, n, k, cout, cin):
         conv = nn.Conv2d(cin, cout, k, bias=False)
+        s = (conv.weight.shape[2] - 1) // 2
+        shift_matrix = self.fft_shift_matrix(n, -s).reshape(n * n, 1, 1).to(conv.weight.device)
         optimizer = torch.optim.SGD(conv.parameters(), lr=0.1)
         loss = torch.nn.MSELoss()
         for i in range(100):
-            wpad = F.pad(conv.weight, (0, n-k, 0, n-k))
-            wpad = F.pad(wpad, (1, 1, 1, 1), mode='circular')
-            wpad = wpad[:, :, 2:, 2:]
-            # print(wpad.shape)
-            # stime = time()
-            H = torch.fft.rfft2(wpad).conj()
-            # print(H.shape)
-            # print('time1:', time() - stime)    
-            L1 = loss(torch.norm(H, dim=1), torch.tensor([np.sqrt(cin/cout)], dtype=torch.float32))
-            L2 = torch.mean(torch.abs(torch.einsum('dchw, dphw -> cphw', H.conj(), H) - torch.eye(cin, dtype=H.dtype)[:, :, None, None]))
-            # L2에 EADK기법사용?
+            H = shift_matrix*torch.fft.fft2(conv.weight, (n, n)).reshape(cout, cin, n * n).permute(2, 0, 1).conj()
+  
+            Hnorm = torch.norm(H, dim=2)
+            # print(cin, cout, n, H.shape, Hnorm.shape)
+            L1 = loss(Hnorm, torch.ones_like(Hnorm, dtype=Hnorm.dtype)*np.sqrt(cin/cout))
+            HH = torch.einsum('ndc, npc -> ndp', H.conj(), H)
+            L2 = torch.mean(torch.pow(HH - torch.eye(cout, dtype=H.dtype)[None, :, :], 2))
             L = L1 + 10*L2
-            # stime = time()
+
             optimizer.zero_grad()
             L.backward()
             optimizer.step()
-            # print('time2:', time() - stime) 
-            # print('target norm:', np.sqrt(cin/cout))
-            # print('L1:', L1.item(), 'L2:', L2.item())
-            # print('result norm:', torch.mean(torch.norm(H, dim=1)).item(), 'result std:', torch.std(torch.norm(H, dim=1)).item())
-            # print('spacial domain norm:', torch.mean(torch.norm(wpad.reshape(cout, -1), dim=1)).item())
-        H = H.reshape(cout, cin, n * (n // 2 + 1)).permute(2, 0, 1).to(self.weight.device).detach()
-        self.Hset.append(H)
-        return H    # H.shape = (cout, cin, n, n)
+
+        H = shift_matrix*torch.fft.fft2(conv.weight, (n, n)).reshape(cout, cin, n * n).permute(2, 0, 1).conj()
+        self.H = H.reshape(n, n, cout, cin)[:, :n//2+1, :, :].reshape(n*(n//2+1), cout, cin).to(self.weight.device).detach()
 
 
     def fft_shift_matrix(self, n, s):
@@ -133,7 +137,10 @@ class CayleyConvED(StridedConv, nn.Conv2d):
         return torch.exp(1j * 2 * np.pi * s * shift / n)
     
     def forward(self, x):
-        cout, cin, _, _ = self.weight.shape
+        # cout, cin, _, _ = self.weight.shape
+        cin = self.args[0]
+        cout = self.args[1]
+
         batches, _, n, _ = x.shape
         if not hasattr(self, 'shift_matrix'):
             s = (self.weight.shape[2] - 1) // 2
@@ -143,24 +150,32 @@ class CayleyConvED(StridedConv, nn.Conv2d):
         #     wfft = self.shift_matrix * torch.fft.rfft2(self.weight).reshape(cout, cin, n * (n // 2 + 1)).permute(2, 0, 1).conj()
         # else:
         #     wfft = self.shift_matrix * torch.fft.rfft2(self.weight, (n, n)).reshape(cout, cin, n * (n // 2 + 1)).permute(2, 0, 1).conj()
-        wfft = self.shift_matrix * torch.fft.rfft2(self.weight, (n, n)).reshape(cout, cin, n * (n // 2 + 1)).permute(2, 0, 1).conj()
+        wfft = self.shift_matrix * torch.fft.rfft2(self.weight, (n, n)).reshape(cin, cin, n * (n // 2 + 1)).permute(2, 0, 1).conj()
         if self.alpha is None:
             self.alpha = nn.Parameter(torch.tensor(wfft.norm().item(), requires_grad=True).to(x.device))
 
-        if cout > cin and self.stride[0] == 1:
-            # print("[cout, cin] : ", [cout, cin])
-            fH = None
-            for H in self.Hset:
-                if H.shape == wfft.shape:
-                    fH = H
-                    break
-            if fH == None:
-                fH = self.genH(n, self.kernel_size[0], cout, cin)
-                print("Hset len : ", len(self.Hset))
-            cwxfft = fH @ cayley(self.alpha * wfft / wfft.norm(), ED=True) @ xfft
+        # if cout > cin and self.stride[0] == 1:
+        #     # print("[cout, cin] : ", [cout, cin])
+        #     fH = None
+        #     for H in self.Hset:
+        #         if H.shape == wfft.shape:
+        #             fH = H
+        #             break
+        #     if fH == None:
+        #         fH = self.genH(n, self.kernel_size[0], cout, cin)
+        #         print("Hset len : ", len(self.Hset))
+        #     cwxfft = fH @ cayley(self.alpha * wfft / wfft.norm(), ED=True) @ xfft
 
-        else:
-            cwxfft = cayley(self.alpha * wfft / wfft.norm()) @ xfft
+        # else:
+        #     cwxfft = cayley(self.alpha * wfft / wfft.norm()) @ xfft
+
+
+        if self.H == None:
+            self.genH(n, self.kernel_size[0], cout, cin)
+
+        # print("wfft norm: ", wfft.norm())
+        cwxfft = self.H @ cayley(self.alpha * wfft / wfft.norm(), ED=True) @ xfft
+
         yfft = (cwxfft).reshape(n, n // 2 + 1, cout, batches)
 
         y = torch.fft.irfft2(yfft.permute(3, 2, 0, 1))

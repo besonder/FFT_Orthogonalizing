@@ -1,4 +1,5 @@
 data/*
 LConvNet/*
 !*/.gitkeep
+.vscode
 __pycache__
