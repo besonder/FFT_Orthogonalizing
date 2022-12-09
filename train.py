@@ -22,7 +22,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='KWLarge', choices=['KWLarge', 'ResNet9', 'WideResNet'])
     parser.add_argument('--conv', default='CayleyConvED', 
-                        choices=['CayleyConv', 'BCOP', 'RKO', 'SVCM', 'OSSN', 'PlainConv', 'CayleyConvED'])
+                        choices=['CayleyConv', 'BCOP', 'RKO', 'SVCM', 'OSSN', 'PlainConv', 'CayleyConvED', 'CayleyConvED2'])
     parser.add_argument('--linear', default='CayleyLinear', 
                         choices=['CayleyLinear', 'BjorckLinear', 'nn.Linear'])
     parser.add_argument('--lr_max', default=0.01, type=float)
